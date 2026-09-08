@@ -1,0 +1,57 @@
+[package]
+name = "speckle"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["multipart", "macros"] }
+blake3 = "1.8.7"
+chrono = "0.4.45"
+dirs = "7.0.0"
+futures-util = "0.3.34"
+image = "0.25.9"
+kamadak-exif = "0.6.1"
+mime_guess = "2.0.5"
+ndarray = "0.17.2"
+notify = "8.2.0"
+num_cpus = "1.17.0"
+# Loaded at runtime rather than linked statically: the prebuilt ONNX Runtime
+# is built against a newer MSVC STL than this toolchain has, and a C-ABI DLL
+# sidesteps that entirely. The DLL is fetched with the models, on demand.
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }
+parking_lot = "0.12.5"
+rayon = "1.12.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rust-embed = { version = "8.12.0", features = ["interpolate-folder-path"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tao = "0.37.0"
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+tower-http = { version = "0.7.1", features = ["fs", "cors", "set-header", "compression-gzip"] }
+ureq = { version = "3.4.1", features = ["json"] }
+urlencoding = "2.1.3"
+walkdir = "2.5.0"
+wry = "0.56.1"
+# Only the "stored" method is used — photos are already compressed, so
+# deflating them again costs minutes and saves almost nothing. Default
+# features drag in decoders that need a newer toolchain than we target.
+# Deflate only. Written archives use "stored" (photos are already compressed),
+# but the model archives we read are deflated. Deflate64 is deliberately left
+# out: its decoder needs a newer toolchain than we target.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Image decoding is unusably slow in an unoptimised build, so dependencies are
+# always compiled with optimisation even in debug. Only our own crate stays
+# debuggable.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "unwind"

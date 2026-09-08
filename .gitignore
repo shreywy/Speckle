@@ -1,0 +1,7 @@
+/target
+/speckle-data
+/loupe-data
+/.playwright-mcp
+*.db
+*.db-wal
+*.db-shm
