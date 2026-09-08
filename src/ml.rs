@@ -866,90 +866,232 @@ fn face_pass(app: &Arc<App>) -> Result<()> {
     Ok(())
 }
 
-/// Greedy agglomerative clustering on cosine similarity. ArcFace embeddings for
-/// the same person sit around 0.5-0.8 apart and different people below 0.3, so
-/// a single threshold is enough and avoids tuning a density parameter.
+/// Cosine threshold for "same person". ArcFace embeddings of one person sit
+/// around 0.5-0.8 apart and different people below 0.3, so a single threshold
+/// beats tuning a density parameter.
+const SAME_PERSON: f32 = 0.42;
+
+fn centroid_of(vectors: &[Vec<f32>]) -> Vec<f32> {
+    let dim = vectors.first().map(|v| v.len()).unwrap_or(FACE_DIM);
+    let mut acc = vec![0f32; dim];
+    for v in vectors {
+        for (a, b) in acc.iter_mut().zip(v) {
+            *a += *b;
+        }
+    }
+    normalize(acc)
+}
+
+/// Attach faces that have no person yet to whichever existing person they match,
+/// creating new people only for faces that match nobody.
+///
+/// This is deliberately incremental. Rebuilding every group from scratch each
+/// time photos arrive would discard the names the user typed and any people
+/// they merged by hand — so existing assignments are never disturbed.
 pub fn cluster(app: &Arc<App>) -> Result<()> {
-    const THRESH: f32 = 0.42;
     let conn = app.index.standalone()?;
 
-    let rows: Vec<(i64, i64, Vec<f32>)> = {
-        let mut st = conn.prepare("SELECT id, media, vec FROM faces ORDER BY id")?;
+    // Existing people and their centroids.
+    let mut people: Vec<(i64, Vec<f32>, f32)> = {
+        let mut st = conn.prepare(
+            "SELECT p.id, p.centroid,
+                    (SELECT COUNT(*) FROM faces f WHERE f.cluster = p.id)
+             FROM people p",
+        )?;
         st.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, from_blob(&r.get::<_, Vec<u8>>(2)?)))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<Vec<u8>>>(1)?.map(|b| from_blob(&b)).unwrap_or_default(),
+                r.get::<_, i64>(2)? as f32,
+            ))
         })?
-        .collect::<Result<_, _>>()?
+        .filter_map(Result::ok)
+        .filter(|(_, v, n)| !v.is_empty() && *n > 0.0)
+        .collect()
     };
-    if rows.is_empty() {
+
+    // A person with no centroid yet (created before this existed) gets one.
+    {
+        let missing: Vec<i64> = {
+            let mut st = conn.prepare(
+                "SELECT id FROM people WHERE centroid IS NULL
+                 AND EXISTS (SELECT 1 FROM faces f WHERE f.cluster = people.id)",
+            )?;
+            st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
+        };
+        for pid in missing {
+            let vecs: Vec<Vec<f32>> = {
+                let mut st = conn.prepare("SELECT vec FROM faces WHERE cluster=?1")?;
+                st.query_map([pid], |r| Ok(from_blob(&r.get::<_, Vec<u8>>(0)?)))?
+                    .collect::<Result<_, _>>()?
+            };
+            if vecs.is_empty() {
+                continue;
+            }
+            let c = centroid_of(&vecs);
+            conn.execute("UPDATE people SET centroid=?2 WHERE id=?1", params![pid, to_blob(&c)])?;
+            people.push((pid, c, vecs.len() as f32));
+        }
+    }
+
+    let loose: Vec<(i64, Vec<f32>)> = {
+        let mut st = conn.prepare("SELECT id, vec FROM faces WHERE cluster IS NULL ORDER BY id")?;
+        st.query_map([], |r| Ok((r.get::<_, i64>(0)?, from_blob(&r.get::<_, Vec<u8>>(1)?))))?
+            .collect::<Result<_, _>>()?
+    };
+    if loose.is_empty() && people.iter().all(|(_, _, n)| *n > 0.0) {
+        refresh_covers(&conn)?;
         return Ok(());
     }
 
-    let mut centroids: Vec<Vec<f32>> = Vec::new();
-    let mut counts: Vec<f32> = Vec::new();
-    let mut assign: Vec<(i64, usize)> = Vec::with_capacity(rows.len());
+    // Faces that match nobody form provisional groups among themselves; a group
+    // only becomes a person once at least two faces agree, which keeps
+    // one-off false positives out of the People page.
+    let mut fresh: Vec<(Vec<f32>, Vec<i64>)> = Vec::new();
+    let mut assign: Vec<(i64, i64)> = Vec::new();
 
-    for (fid, _, v) in &rows {
-        let mut best = (usize::MAX, THRESH);
-        for (i, c) in centroids.iter().enumerate() {
-            let s = dot(v, c);
-            if s > best.1 {
-                best = (i, s);
+    for (fid, v) in &loose {
+        let mut best = (usize::MAX, SAME_PERSON, true);
+        for (i, (_, c, _)) in people.iter().enumerate() {
+            let sc = dot(v, c);
+            if sc > best.1 {
+                best = (i, sc, true);
             }
         }
-        if best.0 == usize::MAX {
-            centroids.push(v.clone());
-            counts.push(1.0);
-            assign.push((*fid, centroids.len() - 1));
-        } else {
-            let i = best.0;
-            let n = counts[i];
-            for k in 0..centroids[i].len() {
-                centroids[i][k] = (centroids[i][k] * n + v[k]) / (n + 1.0);
+        for (i, (c, _)) in fresh.iter().enumerate() {
+            let sc = dot(v, c);
+            if sc > best.1 {
+                best = (i, sc, false);
             }
-            centroids[i] = normalize(std::mem::take(&mut centroids[i]));
-            counts[i] = n + 1.0;
-            assign.push((*fid, i));
+        }
+
+        if best.0 == usize::MAX {
+            fresh.push((v.clone(), vec![*fid]));
+        } else if best.2 {
+            let (pid, c, n) = &mut people[best.0];
+            for (a, b) in c.iter_mut().zip(v) {
+                *a = (*a * *n + *b) / (*n + 1.0);
+            }
+            *c = normalize(std::mem::take(c));
+            *n += 1.0;
+            assign.push((*fid, *pid));
+        } else {
+            let (c, ids) = &mut fresh[best.0];
+            let n = ids.len() as f32;
+            for (a, b) in c.iter_mut().zip(v) {
+                *a = (*a * n + *b) / (n + 1.0);
+            }
+            *c = normalize(std::mem::take(c));
+            ids.push(*fid);
         }
     }
-
-    // A cluster of one is usually a false positive or a passer-by; keep it out
-    // of the People list rather than filling the page with strangers.
-    let keep: std::collections::HashSet<usize> =
-        (0..counts.len()).filter(|i| counts[*i] >= 2.0).collect();
 
     let tx = conn.unchecked_transaction()?;
-    tx.execute("UPDATE faces SET cluster = NULL", [])?;
-    // Names already given are matched back by their most representative face.
-    let existing: Vec<(i64, String)> = {
-        let mut st = tx.prepare("SELECT id, name FROM people WHERE name <> ''")?;
-        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
-    };
-    let old_names: std::collections::HashMap<i64, String> = existing.into_iter().collect();
-    tx.execute("DELETE FROM people", [])?;
-
-    let mut cluster_to_person = std::collections::HashMap::new();
-    for i in keep.iter().copied() {
-        let pid = i as i64 + 1;
-        let name = old_names.get(&pid).cloned().unwrap_or_default();
-        tx.execute("INSERT INTO people(id, name) VALUES(?1, ?2)", params![pid, name])?;
-        cluster_to_person.insert(i, pid);
-    }
     {
         let mut up = tx.prepare_cached("UPDATE faces SET cluster=?2 WHERE id=?1")?;
-        for (fid, ci) in &assign {
-            if let Some(pid) = cluster_to_person.get(ci) {
+        for (fid, pid) in &assign {
+            up.execute(params![fid, pid])?;
+        }
+        let mut mk = tx.prepare_cached("INSERT INTO people(name, centroid) VALUES('', ?1)")?;
+        for (c, ids) in fresh.iter().filter(|(_, ids)| ids.len() >= 2) {
+            mk.execute(params![to_blob(c)])?;
+            let pid = tx.last_insert_rowid();
+            for fid in ids {
                 up.execute(params![fid, pid])?;
             }
         }
+        // Centroids drifted as faces joined.
+        let mut cu = tx.prepare_cached("UPDATE people SET centroid=?2 WHERE id=?1")?;
+        for (pid, c, _) in &people {
+            cu.execute(params![pid, to_blob(c)])?;
+        }
     }
-    // Give every person a cover: the highest-scoring face in the group.
-    tx.execute(
-        "UPDATE people SET cover = (
-           SELECT f.id FROM faces f WHERE f.cluster = people.id ORDER BY f.score DESC LIMIT 1)",
+    tx.commit()?;
+
+    // People whose faces have all gone (photos deleted) should not linger.
+    conn.execute(
+        "DELETE FROM people WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.cluster = people.id)",
         [],
     )?;
-    tx.commit()?;
+    refresh_covers(&conn)?;
     Ok(())
+}
+
+fn refresh_covers(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE people SET cover = (
+           SELECT f.id FROM faces f WHERE f.cluster = people.id ORDER BY f.score DESC LIMIT 1)
+         WHERE cover IS NULL OR cover NOT IN (SELECT id FROM faces WHERE cluster = people.id)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Fold several people into one. Used when the grouping split somebody across
+/// two or more entries, which happens with big changes in lighting, age or
+/// angle. The merge is permanent: later passes only ever *add* faces to
+/// existing people, so it will not be undone by importing more photos.
+pub fn merge_people(app: &Arc<App>, ids: &[i64], into: i64) -> Result<usize> {
+    if ids.len() < 2 {
+        bail!("pick at least two people to merge");
+    }
+    if !ids.contains(&into) {
+        bail!("the person to keep must be one of the selected");
+    }
+    let conn = app.index.standalone()?;
+    let others: Vec<i64> = ids.iter().copied().filter(|i| *i != into).collect();
+
+    let tx = conn.unchecked_transaction()?;
+    let mut moved = 0usize;
+    {
+        let mut up = tx.prepare_cached("UPDATE faces SET cluster=?2 WHERE cluster=?1")?;
+        for o in &others {
+            moved += up.execute(params![o, into])?;
+        }
+        // Keep a name if the merged-away entries had one and the survivor did not.
+        let keep_name: String =
+            tx.query_row("SELECT name FROM people WHERE id=?1", [into], |r| r.get(0)).unwrap_or_default();
+        if keep_name.trim().is_empty() {
+            for o in &others {
+                let n: String =
+                    tx.query_row("SELECT name FROM people WHERE id=?1", [o], |r| r.get(0)).unwrap_or_default();
+                if !n.trim().is_empty() {
+                    tx.execute("UPDATE people SET name=?2 WHERE id=?1", params![into, n])?;
+                    break;
+                }
+            }
+        }
+        for o in &others {
+            tx.execute("DELETE FROM people WHERE id=?1", [o])?;
+        }
+    }
+    tx.commit()?;
+
+    // The survivor now covers a wider spread of faces, so its centroid moves.
+    let vecs: Vec<Vec<f32>> = {
+        let mut st = conn.prepare("SELECT vec FROM faces WHERE cluster=?1")?;
+        st.query_map([into], |r| Ok(from_blob(&r.get::<_, Vec<u8>>(0)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    if !vecs.is_empty() {
+        conn.execute(
+            "UPDATE people SET centroid=?2 WHERE id=?1",
+            params![into, to_blob(&centroid_of(&vecs))],
+        )?;
+    }
+    refresh_covers(&conn)?;
+    Ok(moved)
+}
+
+/// Throw away every grouping and start again. Names and manual merges do not
+/// survive this, which is why it is a separate, explicitly-confirmed action.
+pub fn recluster_from_scratch(app: &Arc<App>) -> Result<()> {
+    {
+        let conn = app.index.standalone()?;
+        conn.execute("UPDATE faces SET cluster = NULL", [])?;
+        conn.execute("DELETE FROM people", [])?;
+    }
+    cluster(app)
 }
 
 /// Crop a stored face out of its photo, for the People page.

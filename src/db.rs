@@ -66,6 +66,7 @@ impl Pool {
         // Migrations for databases created by an earlier version. SQLite has no
         // "ADD COLUMN IF NOT EXISTS", so a failure here just means it is present.
         let _ = c.execute("ALTER TABLE media ADD COLUMN facedone INTEGER NOT NULL DEFAULT 0", []);
+        let _ = c.execute("ALTER TABLE people ADD COLUMN centroid BLOB", []);
         c.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -210,7 +211,12 @@ CREATE TABLE IF NOT EXISTS people (
   id      INTEGER PRIMARY KEY,
   name    TEXT NOT NULL DEFAULT '',
   cover   INTEGER,
-  hidden  INTEGER NOT NULL DEFAULT 0
+  hidden  INTEGER NOT NULL DEFAULT 0,
+  -- Mean of this person's face embeddings, normalised. Kept so that new faces
+  -- can be matched against existing people without reloading every vector,
+  -- and so that grouping never has to start from scratch and throw away names
+  -- or manual merges.
+  centroid BLOB
 );
 
 -- CLIP image embedding, one row per photo, stored as raw little-endian f32.

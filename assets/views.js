@@ -165,17 +165,38 @@ function pagePeople() {
 
   const named = S.people.filter(p => p.name);
   const unnamed = S.people.filter(p => !p.name);
-  const card = p => `<button class="person" data-goperson="${p.id}">
+  const sel = S.psel;
+  const card = p => `<button class="person ${sel.has(p.id) ? 'sel' : ''}" data-person-card="${p.id}">
       <span class="pface">${p.cover ? `<img src="/api/face/${p.cover}" alt="">` : I('face', 24)}</span>
+      <span class="ptick">${I('check', 12, 3)}</span>
       <b>${esc(p.name || 'Unnamed')}</b><span>${fmtCount(p.count)} photos</span>
     </button>`;
+
+  // The person the merge keeps: a named one if exactly one is named, otherwise
+  // whoever has the most photos.
+  const chosen = mergeTarget();
 
   return `<div class="page">
     <h2>People</h2>
     <p class="lede">${fmtCount(ml.faces)} faces found across ${fmtCount(ml.people)} people.
-      Click a face to see their photos, then give them a name.</p>
+      Click a face to see their photos, then give them a name. If the same person
+      shows up twice, select both and merge them.</p>
+
     ${ml.faces_pending ? `<div class="banner"><span class="ic">${I('face', 15)}</span>
       <p>Still working through ${fmtCount(ml.faces_pending)} photos.</p></div>` : ''}
+
+    <div class="strip-alert" style="background:var(--panel);border-color:${sel.size >= 2 ? 'var(--accent-line)' : 'var(--line)'}">
+      <p>${sel.size
+        ? `<b>${sel.size} selected.</b> ${sel.size >= 2
+            ? `They will be merged into <b>${esc(chosen ? (chosen.name || 'the group with ' + chosen.count + ' photos') : '')}</b>.`
+            : 'Select at least one more to merge.'}`
+        : `<b>${S.pselMode ? 'Pick the people who are the same person.' : 'Same person listed twice?'}</b> ${
+            S.pselMode ? '' : 'Turn on Select, tick each copy, then merge them into one.'}`}</p>
+      <span class="grow" style="flex:1"></span>
+      ${sel.size >= 2 ? `<button class="btn solid" data-act="merge-people">${I('face', 15)} Merge ${sel.size} into one</button>` : ''}
+      <button class="btn ${S.pselMode ? 'on' : 'outline'}" data-act="people-select">${I('check', 15)} ${S.pselMode ? 'Done' : 'Select'}</button>
+    </div>
+
     ${named.length ? `<div class="sec-h"><h3>Named</h3><span class="rule"></span></div>
       <div class="people">${named.map(card).join('')}</div>` : ''}
     ${unnamed.length ? `<div class="sec-h"><h3>Not named yet</h3><span class="rule"></span>
@@ -183,6 +204,15 @@ function pagePeople() {
       <div class="people">${unnamed.map(card).join('')}</div>` : ''}
     ${!S.people.length ? `<div class="card">No faces found yet.</div>` : ''}
   </div>`;
+}
+
+/** Which person a merge should keep. */
+function mergeTarget() {
+  const picked = (S.people || []).filter(p => S.psel.has(p.id));
+  if (!picked.length) return null;
+  const withName = picked.filter(p => p.name);
+  if (withName.length === 1) return withName[0];
+  return picked.slice().sort((a, b) => b.count - a.count)[0];
 }
 
 // ========================================================= collections =====
@@ -348,7 +378,7 @@ function pageSettings() {
           <span class="mono">${fmtCount(ml.faces)} faces · ${fmtCount(ml.people)} people</span>
         </div>
         <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
-          <button class="btn outline" data-act="recluster">${I('refresh', 15)} Regroup people</button>
+          <button class="btn outline" data-act="recluster">${I('refresh', 15)} Rebuild groups from scratch</button>
           <button class="btn outline danger" data-act="disable-faces">Turn off</button>
         </div>`
         : `<div class="mlstat"><span class="st">Off</span>
@@ -481,8 +511,15 @@ window.wirePage = function () {
   if (S.view === 'settings') wireSettings();
   if (S.view === 'upload') wireUpload();
   if (S.view === 'people' && !S.people.length) loadPeople();
-  $$('[data-goperson]').forEach(b => b.addEventListener('click', () => {
-    S.person = +b.dataset.goperson; S.view = 'person'; go();
+  $$('[data-person-card]').forEach(b => b.addEventListener('click', e => {
+    const id = +b.dataset.personCard;
+    if (S.pselMode || e.ctrlKey || e.metaKey) {
+      S.psel.has(id) ? S.psel.delete(id) : S.psel.add(id);
+      S.pselMode = true;
+      renderMain();
+    } else {
+      S.person = id; S.view = 'person'; go();
+    }
   }));
 };
 
@@ -506,7 +543,32 @@ window.pageAction = async function (a) {
     case 'disable-clip': await post('/api/ml/disable', { what: 'clip' }); await refreshServer(); renderMain(); break;
     case 'disable-faces': await post('/api/ml/disable', { what: 'faces' }); await refreshServer(); renderMain(); break;
     case 'reindex-clip': await post('/api/ml/reindex', { what: 'clip' }); toast('Re-analysing'); break;
-    case 'recluster': await post('/api/ml/recluster', {}); toast('Regrouping people'); await loadPeople(); break;
+    case 'recluster':
+      if (!confirm('Rebuild every person group from scratch?\n\nNames you have typed and people you have merged by hand will be lost. Normal imports do not need this — new faces join existing people on their own.')) return;
+      await post('/api/ml/recluster', {});
+      toast('Rebuilding groups');
+      await loadPeople();
+      break;
+
+    case 'people-select':
+      S.pselMode = !S.pselMode;
+      if (!S.pselMode) S.psel.clear();
+      renderMain();
+      break;
+
+    case 'merge-people': {
+      const target = mergeTarget();
+      if (!target || S.psel.size < 2) return;
+      const label = target.name || `the group with ${target.count} photos`;
+      if (!confirm(`Merge ${S.psel.size} groups into ${label}?\n\nThis is permanent, but it only combines groups — no photos are changed, and later imports will add to the merged person rather than splitting them again.`)) return;
+      try {
+        const r = await post('/api/people/merge', { ids: [...S.psel], into: target.id });
+        S.psel.clear(); S.pselMode = false;
+        await loadPeople(); renderSide(); renderMain();
+        toast(`Merged — ${r.moved} faces moved into one person`);
+      } catch (e) { toast(e.message, 'err'); }
+      break;
+    }
   }
 };
 

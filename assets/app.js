@@ -177,6 +177,7 @@ const S = {
   compress: { quality: 82, max_edge: 4096, keep_originals: true, skip_rated: false, scope: 'oversized' },
   sideOpen: false,
   expanded: new Set(),
+  psel: new Set(), pselMode: false,
 };
 
 const K = {

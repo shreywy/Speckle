@@ -83,6 +83,7 @@ pub async fn serve(app: Arc<App>) -> Result<()> {
         .route("/api/search", get(semantic_search))
         .route("/api/people", get(people_list))
         .route("/api/people/{id}", post(people_rename))
+        .route("/api/people/merge", post(people_merge))
         .route("/api/face/{id}", get(face_thumb))
         .route("/api/ml/enable", post(ml_enable))
         .route("/api/ml/disable", post(ml_disable))
@@ -1174,9 +1175,26 @@ async fn ml_reindex(State(app): S, Json(b): Json<WhatReq>) -> Response {
     Json(json!({"ok": true})).into_response()
 }
 
+async fn people_merge(State(app): S, Json(b): Json<MergeReq>) -> Response {
+    let a = app.clone();
+    let into = b.into.unwrap_or_else(|| *b.ids.first().unwrap_or(&0));
+    match blocking(move || Ok(ml::merge_people(&a, &b.ids, into)?)).await {
+        Ok(n) => Json(json!({"ok": true, "moved": n, "into": into})).into_response(),
+        Err(e) => e,
+    }
+}
+
+#[derive(Deserialize)]
+struct MergeReq {
+    #[serde(default)]
+    ids: Vec<i64>,
+    #[serde(default)]
+    into: Option<i64>,
+}
+
 async fn ml_recluster(State(app): S) -> Response {
     let a = app.clone();
-    match blocking(move || ml::cluster(&a)).await {
+    match blocking(move || ml::recluster_from_scratch(&a)).await {
         Ok(_) => Json(json!({"ok": true})).into_response(),
         Err(e) => e,
     }
