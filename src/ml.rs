@@ -111,7 +111,20 @@ fn ensure_runtime(app: &Arc<App>) -> Result<()> {
     Ok(())
 }
 
-fn fetch(app: &Arc<App>, url: &str, dest: &Path, approx: u64, label: &str) -> Result<()> {
+pub fn fetch(app: &Arc<App>, url: &str, dest: &Path, approx: u64, label: &str) -> Result<()> {
+    fetch_with(app, url, dest, approx, label, false)
+}
+
+/// `secondary` routes progress to the task board instead of the main job slot,
+/// so a download can run alongside indexing rather than waiting behind it.
+pub fn fetch_with(
+    app: &Arc<App>,
+    url: &str,
+    dest: &Path,
+    approx: u64,
+    label: &str,
+    secondary: bool,
+) -> Result<()> {
     if dest.exists() {
         return Ok(());
     }
@@ -137,10 +150,21 @@ fn fetch(app: &Arc<App>, url: &str, dest: &Path, approx: u64, label: &str) -> Re
         }
         std::io::Write::write_all(&mut out, &buf[..n])?;
         got += n as u64;
-        let mut j = app.job.write();
-        j.done = got / 1024;
-        j.total = total.max(got) / 1024;
-        j.label = format!("{label} — {:.0} MB of {:.0} MB", got as f64 / 1e6, total as f64 / 1e6);
+        let text = format!("{label} — {:.0} MB of {:.0} MB", got as f64 / 1e6, total as f64 / 1e6);
+        if secondary {
+            let mut b = app.jobs.write();
+            let t = b.task.get_or_insert_with(Default::default);
+            t.kind = "download".into();
+            t.running = true;
+            t.done = got / 1024;
+            t.total = total.max(got) / 1024;
+            t.label = text;
+        } else {
+            let mut j = app.job.write();
+            j.done = got / 1024;
+            j.total = total.max(got) / 1024;
+            j.label = text;
+        }
     }
     std::io::Write::flush(&mut out)?;
     drop(out);
@@ -206,7 +230,7 @@ pub fn spawn_install(app: Arc<App>, what: String) {
 
 /// buffalo_l.zip carries five models; only two are wanted, and the archive is
 /// stored so extraction is a straight copy.
-fn extract_needed(zip_path: &Path, dir: &Path, wanted: &[&str]) -> Result<()> {
+pub fn extract_needed(zip_path: &Path, dir: &Path, wanted: &[&str]) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))?;
     for i in 0..zip.len() {
@@ -1185,6 +1209,10 @@ fn flag(app: &Arc<App>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn has_work(app: &Arc<App>, sql: &str) -> bool {
+    pending(app, sql) != 0
+}
+
 fn pending(app: &Arc<App>, sql: &str) -> i64 {
     app.index
         .get()
@@ -1193,10 +1221,13 @@ fn pending(app: &Arc<App>, sql: &str) -> i64 {
         .unwrap_or(0)
 }
 
-const CLIP_PENDING: &str = "SELECT COUNT(*) FROM media
-     WHERE missing=0 AND deleted IS NULL AND state=1 AND id NOT IN (SELECT media FROM clip)";
-const FACE_PENDING: &str = "SELECT COUNT(*) FROM media
-     WHERE missing=0 AND deleted IS NULL AND state=1 AND kind<>1 AND facedone=0";
+/// Existence, not counts. These run on a timer forever, and a COUNT(*) over an
+/// anti-join scans the whole table even when the answer is "none".
+const CLIP_PENDING: &str = "SELECT EXISTS(SELECT 1 FROM media
+     WHERE missing=0 AND deleted IS NULL AND state=1
+       AND id NOT IN (SELECT media FROM clip) LIMIT 1)";
+const FACE_PENDING: &str = "SELECT EXISTS(SELECT 1 FROM media
+     WHERE missing=0 AND deleted IS NULL AND state=1 AND kind<>1 AND facedone=0 LIMIT 1)";
 
 /// Keep understanding current without anyone asking.
 ///
@@ -1205,54 +1236,90 @@ const FACE_PENDING: &str = "SELECT COUNT(*) FROM media
 /// through it. It only ever runs while nothing else is, so it never competes
 /// with indexing or a recompression job for the disk.
 pub fn spawn_worker(app: Arc<App>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(4));
+    std::thread::spawn(move || {
+        // Back off when idle. A library that is fully processed should cost
+        // nothing to sit on: this settles at one cheap EXISTS query a minute
+        // rather than three COUNT(*) queries every four seconds.
+        let mut idle_secs = 4u64;
+        let mut idle_ticks = 0u32;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(idle_secs));
 
-        // Never start on top of a scan, a thumbnail pass or a bulk job.
-        if app.job.read().running {
-            continue;
-        }
-        if app.jobs.read().task.as_ref().map(|t| t.running).unwrap_or(false) {
-            continue;
-        }
-
-        // A scan that was deferred while the disk was busy runs first: there is
-        // no point understanding photos that have not been indexed yet.
-        if app.rescan_pending.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            crate::scan::spawn(app.clone(), None, false);
-            continue;
-        }
-
-        if flag(&app, "clip_on") && clip_installed(&app) && pending(&app, CLIP_PENDING) > 0 {
-            if let Err(e) = clip_pass(&app) {
-                eprintln!("[ml] background tagging: {e:#}");
-                // Back off rather than retry a failing model in a tight loop.
-                std::thread::sleep(std::time::Duration::from_secs(60));
+            // Never start on top of a scan, a thumbnail pass or a bulk job.
+            if app.job.read().running {
+                idle_secs = 4;
+                continue;
             }
-            let mut j = app.job.write();
-            j.running = false;
-            j.phase = "idle".into();
-            continue;
-        }
+            if app.jobs.read().task.as_ref().map(|t| t.running).unwrap_or(false) {
+                idle_secs = 4;
+                continue;
+            }
 
-        if flag(&app, "faces_on") && faces_installed(&app) && pending(&app, FACE_PENDING) > 0 {
-            let r = face_pass(&app);
-            {
+            // A scan that was deferred while the disk was busy runs first:
+            // there is no point understanding photos that are not indexed yet.
+            if app.rescan_pending.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                let retry = app.retry_pending.swap(false, std::sync::atomic::Ordering::Relaxed);
+                crate::scan::spawn_ex(app.clone(), None, false, retry);
+                idle_secs = 4;
+                continue;
+            }
+
+            let want_clip = flag(&app, "clip_on") && clip_installed(&app) && has_work(&app, CLIP_PENDING);
+            if want_clip {
+                idle_secs = 4;
+                idle_ticks = 0;
+                if let Err(e) = clip_pass(&app) {
+                    eprintln!("[ml] background tagging: {e:#}");
+                    // Back off rather than retry a failing model in a tight loop.
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                }
                 let mut j = app.job.write();
                 j.running = false;
                 j.phase = "idle".into();
+                continue;
             }
-            match r {
-                // New faces only belong to people once they have been grouped.
-                Ok(()) => {
-                    if let Err(e) = cluster(&app) {
-                        eprintln!("[ml] background clustering: {e:#}");
+
+            let want_faces = flag(&app, "faces_on") && faces_installed(&app) && has_work(&app, FACE_PENDING);
+            if want_faces {
+                idle_secs = 4;
+                idle_ticks = 0;
+                let r = face_pass(&app);
+                {
+                    let mut j = app.job.write();
+                    j.running = false;
+                    j.phase = "idle".into();
+                }
+                match r {
+                    // New faces belong to people only once they are grouped.
+                    Ok(()) => {
+                        if let Err(e) = cluster(&app) {
+                            eprintln!("[ml] background clustering: {e:#}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[ml] background faces: {e:#}");
+                        std::thread::sleep(std::time::Duration::from_secs(60));
                     }
                 }
-                Err(e) => {
-                    eprintln!("[ml] background faces: {e:#}");
-                    std::thread::sleep(std::time::Duration::from_secs(60));
+                continue;
+            }
+
+            // Nothing to do: check less and less often, up to once a minute.
+            idle_secs = (idle_secs * 2).min(60);
+
+            // Once the backlog is gone, hand back the model memory. The ONNX
+            // sessions hold roughly 350 MB between them, which is absurd for a
+            // process that is only waiting; they reload in about a second the
+            // next time photos arrive.
+            idle_ticks += 1;
+            if idle_ticks >= 5 {
+                let had = app.clip.read().is_some() || app.faces.read().is_some();
+                if had {
+                    *app.clip.write() = None;
+                    *app.faces.write() = None;
+                    println!("[ml] idle — released the models to free memory");
                 }
+                idle_ticks = 0;
             }
         }
     });

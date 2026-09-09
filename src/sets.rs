@@ -261,3 +261,61 @@ pub fn reveal(path: &str) -> Result<()> {
         Ok(())
     }
 }
+
+
+// ------------------------------------------------- native folder picker ----
+
+/// Open the operating system's own folder chooser. Only meaningful on the
+/// machine running Speckle; the web UI hides it when viewed from a phone,
+/// where the built-in browser is used instead.
+pub fn pick_folder_native() -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title("Choose a folder for Speckle to watch")
+        .pick_folder()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+}
+
+// ------------------------------------------------------ start with windows -
+
+#[cfg(windows)]
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
+const RUN_NAME: &str = "Speckle";
+
+/// Whether Speckle is set to start with Windows.
+#[cfg(windows)]
+pub fn startup_enabled() -> bool {
+    use winreg::enums::*;
+    winreg::RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(RUN_KEY)
+        .and_then(|k| k.get_value::<String, _>(RUN_NAME))
+        .is_ok()
+}
+
+/// Register (or clear) the per-user Run entry.
+///
+/// It launches with `--server`, so a login starts the background service
+/// without opening a window: no WebView, and a few tens of megabytes instead of
+/// several hundred. Opening the app afterwards attaches to it.
+#[cfg(windows)]
+pub fn set_startup(enabled: bool) -> Result<()> {
+    use winreg::enums::*;
+    let hkcu = winreg::RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu.create_subkey(RUN_KEY)?;
+    if enabled {
+        let exe = std::env::current_exe()?;
+        key.set_value(RUN_NAME, &format!("\"{}\" --server", exe.display()))?;
+    } else {
+        let _ = key.delete_value(RUN_NAME);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn startup_enabled() -> bool {
+    false
+}
+#[cfg(not(windows))]
+pub fn set_startup(_enabled: bool) -> Result<()> {
+    bail!("only supported on Windows")
+}

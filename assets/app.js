@@ -582,10 +582,30 @@ const tiles = new Map();
 const heads = new Map();
 const pending = new Set();
 
+/* Tiles scrolled out of view are detached but kept, not destroyed.
+ *
+ * Rebuilding an <img> forces the engine to fetch and decode again — even from
+ * cache that costs tens of milliseconds each, which is why scrolling back up
+ * used to crawl. Holding the element keeps its decoded bitmap alive, so coming
+ * back is instant. The pool is capped so a long scroll cannot grow without
+ * bound; at ~24 KB of decoded pixels per 320px tile this is a few tens of MB. */
+const parked = new Map();
+const PARK_MAX = 1200;
+
+function park(id, el) {
+  el.remove();
+  parked.delete(id);       // re-insert so Map order stays least-recent-first
+  parked.set(id, el);
+  while (parked.size > PARK_MAX) {
+    const oldest = parked.keys().next().value;
+    parked.delete(oldest);
+  }
+}
+
 function dropRendered() {
   tiles.forEach(el => el.remove());
   heads.forEach(el => el.remove());
-  tiles.clear(); heads.clear(); pending.clear();
+  tiles.clear(); heads.clear(); pending.clear(); parked.clear();
 }
 
 function paint() {
@@ -597,7 +617,9 @@ function paint() {
 
   const { blocks, tile, rowH, cols } = S.layout;
   const top = scroll.scrollTop, vh = scroll.clientHeight;
-  const y0 = top - rowH * 2, y1 = top + vh + rowH * 4;
+  // Generous overscan in both directions: rows above matter as much as below,
+  // because scrolling back up is the common case.
+  const y0 = top - rowH * 6, y1 = top + vh + rowH * 8;
 
   const wantTiles = new Map(), wantHeads = new Set();
   for (const b of blocks) {
@@ -615,7 +637,7 @@ function paint() {
     }
   }
 
-  for (const [id, el] of tiles) if (!wantTiles.has(id)) { el.remove(); tiles.delete(id); }
+  for (const [id, el] of tiles) if (!wantTiles.has(id)) { park(id, el); tiles.delete(id); }
   const keys = new Set([...wantHeads].map(b => b.key));
   for (const [key, el] of heads) if (!keys.has(key)) { el.remove(); heads.delete(key); }
 
@@ -634,7 +656,13 @@ function paint() {
 
   for (const [id, pos] of wantTiles) {
     let el = tiles.get(id);
-    if (!el) { el = makeTile(id, pos.idx); inner.appendChild(el); tiles.set(id, el); }
+    if (!el) {
+      el = parked.get(id);
+      if (el) parked.delete(id);          // reuse: image already decoded
+      else el = makeTile(id, pos.idx);
+      inner.appendChild(el);
+      tiles.set(id, el);
+    }
     el.style.width = tile + 'px';
     el.style.height = tile + 'px';
     el.style.transform = `translate(${pos.x}px, ${pos.y}px)`;
@@ -1335,7 +1363,10 @@ document.addEventListener('keydown', async e => {
 
 let lastJob = '';
 function poll() {
-  setInterval(async () => {
+  // Polling is paced by what is happening, and stops entirely when the window
+  // is hidden — a background server with nobody watching should cost nothing.
+  let timer = null;
+  const tick = async () => {
     const snap = o => JSON.stringify([o.job, o.counts, o.task, o.ml]);
     const before = S.server ? snap(S.server) : '';
     await refreshServer();
@@ -1357,7 +1388,16 @@ function poll() {
       if (window.loadStorage) window.loadStorage();
     }
     lastJob = key;
-  }, 1200);
+
+    const busy = (S.server.job && S.server.job.running)
+              || (S.server.task && S.server.task.running);
+    timer = setTimeout(tick, document.hidden ? 30000 : busy ? 1200 : 6000);
+  };
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { clearTimeout(timer); tick(); }
+  });
+  tick();
   if (window.loadStorage) window.loadStorage();
 }
 

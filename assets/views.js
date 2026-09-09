@@ -330,6 +330,8 @@ function pageSettings() {
       <span class="fdot" style="background:${l.color}22;color:${l.color}">${I('folder', 18)}</span>
       <span class="m"><b>${esc(l.name)}</b><span>${esc(l.path)} · ${fmtCount(l.count)} items · ${fmtBytes(l.bytes)}</span></span>
       <span class="st ${sv.job && sv.job.running ? 'run' : 'ok'}">${sv.job && sv.job.running ? 'Indexing' : 'Indexed'}</span>
+      <button class="btn outline" data-excl="${l.id}" title="Choose sub-folders to leave out">
+        ${I('folder', 14)} Exclude${l.excludes && l.excludes.length ? ` (${l.excludes.length})` : ''}</button>
       ${isLocal() ? `<button class="btn icon" data-revealpath="${esc(l.path)}" title="Show in Explorer">${I('external', 15)}</button>` : ''}
       <button class="btn icon danger" data-rmlib="${l.id}" title="Remove from Speckle">${I('close', 15)}</button>
     </div>`).join('');
@@ -348,6 +350,33 @@ function pageSettings() {
       <button class="btn outline" data-act="rescan">${I('refresh', 15)} Rescan</button>
       <button class="btn solid" data-act="add-lib">${I('plus', 15)} Add folder</button></div>
     ${libs || `<div class="card">No folders yet. Everything inside a folder you add — including every sub-folder — becomes part of that one library.</div>`}
+
+    <div class="sec-h"><h3>Unreadable files</h3><span class="rule"></span></div>
+    <div class="card">
+      <dl class="kv" style="padding-left:0"><dt>ffmpeg</dt>
+        <dd>${sv.ffmpeg ? esc(sv.ffmpeg_version || 'found') : 'NOT FOUND'}${sv.ffmpeg_own ? ' · Speckle\'s own copy' : ''}</dd></dl>
+      <dl class="kv" style="padding-left:0"><dt>Could not be read</dt>
+        <dd>${fmtCount(sv.failed || 0)}${sv.heic_failed ? ` · ${fmtCount(sv.heic_failed)} HEIC` : ''}</dd></dl>
+      ${sv.heic_failed > 0 && !sv.ffmpeg_own ? `
+        <div class="warnbox" style="margin-top:10px">${I('alert', 16)}<span>
+          <b>${fmtCount(sv.heic_failed)} HEIC photos cannot be read by your ffmpeg.</b>
+          FFmpeg only learned to decode HEIC in version 7.0, and the build on your PATH is older.
+          Speckle can download a current one into its own folder — your system and PATH are left alone.</span></div>
+        <button class="btn solid" data-act="get-ffmpeg" style="margin-top:12px">
+          ${I('download', 15)} Download a current ffmpeg (~107 MB)</button>` : ''}
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+        <button class="btn outline" data-act="retry-failed">${I('refresh', 15)} Retry unreadable files</button>
+        ${sv.failed ? `<button class="btn outline" data-act="show-failed">${I('eye', 15)} Show them</button>` : ''}
+      </div>
+    </div>
+
+    <div class="sec-h"><h3>Startup</h3><span class="rule"></span></div>
+    <div class="card">
+      <div class="toggle"><button class="tg" data-act="toggle-startup" aria-pressed="${!!sv.startup}" role="switch"></button>
+        <span class="tx"><b>Start with Windows</b>
+          <span>Launches in the background with no window, so your phone can reach it after a reboot.
+            Idles at about 30 MB; opening the app afterwards attaches to the same process.</span></span></div>
+    </div>
 
     <div class="sec-h"><h3>Photo understanding</h3><span class="rule"></span></div>
     <div class="card">
@@ -543,6 +572,32 @@ window.pageAction = async function (a) {
     case 'disable-clip': await post('/api/ml/disable', { what: 'clip' }); await refreshServer(); renderMain(); break;
     case 'disable-faces': await post('/api/ml/disable', { what: 'faces' }); await refreshServer(); renderMain(); break;
     case 'reindex-clip': await post('/api/ml/reindex', { what: 'clip' }); toast('Re-analysing'); break;
+    case 'get-ffmpeg':
+      if (!confirm('Download a current ffmpeg (about 107 MB) into Speckle\'s own folder?\n\nYour system ffmpeg and PATH are not touched. Unreadable files are retried automatically afterwards.')) return;
+      try { await post('/api/tools/ffmpeg', {}); toast('Downloading ffmpeg — progress is in the sidebar'); }
+      catch (e) { toast(e.message, 'err'); }
+      break;
+
+    case 'retry-failed':
+      await post('/api/rescan', { retry_failed: true });
+      toast('Retrying every file that could not be read');
+      break;
+
+    case 'show-failed':
+      S.view = 'grid'; S.filter = 'error'; S.lib = null; S.sub = null; S.coll = null; S.person = null;
+      go();
+      break;
+
+    case 'toggle-startup': {
+      const want = !(S.server && S.server.startup);
+      try {
+        await post('/api/startup', { enabled: want });
+        await refreshServer(); renderMain();
+        toast(want ? 'Speckle will start with Windows' : 'Speckle will no longer start with Windows');
+      } catch (e) { toast(e.message, 'err'); }
+      break;
+    }
+
     case 'recluster':
       if (!confirm('Rebuild every person group from scratch?\n\nNames you have typed and people you have merged by hand will be lost. Normal imports do not need this — new faces join existing people on their own.')) return;
       await post('/api/ml/recluster', {});
@@ -636,6 +691,8 @@ async function pickFolder(onPick, title) {
       <header><h3>${esc(title || 'Add a folder')}</h3>
         <p>Everything inside it, including every sub-folder, becomes one library.</p></header>
       <div class="body">
+        ${isLocal() ? `<button class="btn outline" data-native style="width:100%;justify-content:center;margin-bottom:10px">
+          ${I('folder', 15)} Browse with Windows…</button>` : ''}
         <div class="crumbs">
           <button data-go="">Drives</button>
           ${parts.map((p, i) => `<span>/</span><button data-go="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</button>`).join('')}
@@ -655,6 +712,19 @@ async function pickFolder(onPick, title) {
 
   scrim.addEventListener('click', async e => {
     if (e.target === scrim || e.target.closest('[data-close]')) { scrim.remove(); return; }
+    if (e.target.closest('[data-native]')) {
+      // The host's own dialog, which only makes sense on the machine itself.
+      try {
+        const r = await post('/api/pick-folder', {});
+        if (!r.path) return;
+        scrim.remove();
+        if (onPick) return onPick(r.path);
+        await post('/api/libraries', { path: r.path });
+        toast('Indexing ' + r.path);
+        await refreshServer(); renderSide(); loadList();
+      } catch (err) { toast(err.message, 'err'); }
+      return;
+    }
     const g = e.target.closest('[data-go]');
     if (g) { cwd = g.dataset.go; draw(); return; }
     if (e.target.closest('[data-add]')) {
@@ -753,4 +823,68 @@ document.addEventListener('click', async e => {
     const idx = S.list.ids.indexOf(+oi.dataset.openId);
     if (idx >= 0) openViewer(idx);
   }
+});
+
+
+/** Choose sub-folders a library should skip. */
+async function excludeFolders(libId) {
+  const scrim = document.createElement('div');
+  scrim.className = 'scrim';
+  scrim.innerHTML = `<div class="modal"><header><h3>Folders to leave out</h3>
+    <p>Loading…</p></header></div>`;
+  document.body.appendChild(scrim);
+
+  let data;
+  try { data = await api(`/api/libraries/${libId}/folders`); }
+  catch (e) { scrim.remove(); toast(e.message, 'err'); return; }
+
+  const chosen = new Set(data.excludes);
+  const draw = () => {
+    scrim.innerHTML = `<div class="modal">
+      <header><h3>Folders to leave out</h3>
+        <p>Ticked folders are skipped when indexing, and anything already indexed
+           inside them is removed from Speckle. The files themselves are never touched.</p></header>
+      <div class="body">
+        <div class="dirlist">
+          ${data.folders.map(f => `<button class="dirrow" data-x="${esc(f.sub)}">
+            <span class="check" style="position:static;opacity:1;${chosen.has(f.sub)
+              ? 'background:var(--accent);border-color:var(--accent);color:var(--accent-ink)'
+              : 'background:transparent;border-color:var(--line);color:transparent'}">${I('check', 11, 3)}</span>
+            <span class="mono" style="flex:1;overflow:hidden;text-overflow:ellipsis">${esc(f.sub)}</span>
+            <span class="count-label" style="margin:0">${fmtCount(f.count)}</span>
+          </button>`).join('') || '<div class="dirrow" style="color:var(--text-3)">No sub-folders</div>'}
+        </div>
+      </div>
+      <footer>
+        <span class="count-label" style="margin-right:auto">${chosen.size} excluded</span>
+        <button class="btn outline" data-close>Cancel</button>
+        <button class="btn solid" data-save>Save</button>
+      </footer></div>`;
+  };
+  draw();
+
+  scrim.addEventListener('click', async e => {
+    if (e.target === scrim || e.target.closest('[data-close]')) { scrim.remove(); return; }
+    const row = e.target.closest('[data-x]');
+    if (row) {
+      const k = row.dataset.x;
+      chosen.has(k) ? chosen.delete(k) : chosen.add(k);
+      draw();
+      return;
+    }
+    if (e.target.closest('[data-save]')) {
+      scrim.remove();
+      try {
+        const r = await post(`/api/libraries/${libId}/excludes`, { subs: [...chosen] });
+        toast(r.removed ? `Excluded ${r.excluded} folders — removed ${fmtCount(r.removed)} items`
+                        : `Excluded ${r.excluded} folders`);
+        await refreshServer(); renderSide(); renderMain(); loadList();
+      } catch (err) { toast(err.message, 'err'); }
+    }
+  });
+}
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-excl]');
+  if (b) excludeFolders(+b.dataset.excl);
 });

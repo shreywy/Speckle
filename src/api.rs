@@ -60,6 +60,11 @@ pub async fn serve(app: Arc<App>) -> Result<()> {
         .route("/api/libraries", post(add_library))
         .route("/api/libraries/{id}", delete(remove_library))
         .route("/api/rescan", post(rescan))
+        .route("/api/tools/ffmpeg", post(install_ffmpeg))
+        .route("/api/pick-folder", post(pick_folder))
+        .route("/api/startup", get(get_startup).post(post_startup))
+        .route("/api/libraries/{id}/excludes", post(set_excludes))
+        .route("/api/libraries/{id}/folders", get(library_folders))
         .route("/api/media", get(media_list))
         .route("/api/media/{id}", get(media_one))
         .route("/api/media/{id}/meta", post(media_meta))
@@ -139,7 +144,8 @@ async fn state(State(app): S) -> Response {
         let mut st = c.prepare(
             "SELECT l.id, l.path, l.name, l.color,
                     (SELECT COUNT(*) FROM media m WHERE m.lib=l.id AND m.deleted IS NULL AND m.missing=0),
-                    (SELECT COALESCE(SUM(bytes),0) FROM media m WHERE m.lib=l.id AND m.deleted IS NULL AND m.missing=0)
+                    (SELECT COALESCE(SUM(bytes),0) FROM media m WHERE m.lib=l.id AND m.deleted IS NULL AND m.missing=0),
+                    l.excludes
              FROM libraries l ORDER BY l.id",
         )?;
         let libs: Vec<Value> = st
@@ -147,10 +153,25 @@ async fn state(State(app): S) -> Response {
                 Ok(json!({
                   "id": r.get::<_,i64>(0)?, "path": r.get::<_,String>(1)?,
                   "name": r.get::<_,String>(2)?, "color": r.get::<_,String>(3)?,
-                  "count": r.get::<_,i64>(4)?, "bytes": r.get::<_,i64>(5)?
+                  "count": r.get::<_,i64>(4)?, "bytes": r.get::<_,i64>(5)?,
+                  "excludes": r.get::<_,String>(6)?
+                      .lines().map(|s| s.trim().to_string())
+                      .filter(|s| !s.is_empty()).collect::<Vec<_>>()
                 }))
             })?
             .collect::<Result<_, _>>()?;
+
+        // Serve recent numbers rather than recomputing them for every poll.
+        // Anything that changes fast enough to matter (job progress) is read
+        // live below and is not part of this cache.
+        if let Some((at, cached)) = a.counts_cache.read().as_ref() {
+            if at.elapsed() < std::time::Duration::from_millis(2500) {
+                let mut v = cached.clone();
+                v["job"] = serde_json::to_value(a.job.read().clone()).unwrap_or(Value::Null);
+                v["task"] = serde_json::to_value(a.jobs.read().task.clone()).unwrap_or(Value::Null);
+                return Ok(v);
+            }
+        }
 
         let counts = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
         let total = counts("SELECT COUNT(*) FROM media WHERE deleted IS NULL AND missing=0");
@@ -198,7 +219,7 @@ async fn state(State(app): S) -> Response {
              AND kind<>1 AND facedone=0",
         );
 
-        Ok(json!({
+        let out = json!({
           "ml": {
             "ready": clip_ready, "faces_ready": faces_ready,
             "tagged": tagged, "pending": clip_pending,
@@ -211,12 +232,20 @@ async fn state(State(app): S) -> Response {
           "job": a.job.read().clone(),
           "task": a.jobs.read().task.clone(),
           "ffmpeg": a.ffmpeg,
+          "ffmpeg_version": decode::ffmpeg_version(),
+          "ffmpeg_own": decode::using_own_ffmpeg(),
+          "startup": sets::startup_enabled(),
+          "heic_failed": counts(
+            "SELECT COUNT(*) FROM media WHERE state=2 AND ext IN ('heic','heif','hif')"),
+          "failed": counts("SELECT COUNT(*) FROM media WHERE state=2"),
           "port": a.port,
           "addrs": a.addrs,
           "data_dir": a.data_dir.to_string_lossy().replace('\\', "/"),
           "settings": settings,
           "uptime": a.started.elapsed().as_secs(),
-        }))
+        });
+        *a.counts_cache.write() = Some((std::time::Instant::now(), out.clone()));
+        Ok(out)
     })
     .await
     {
@@ -354,11 +383,13 @@ struct RescanReq {
     libs: Option<Vec<i64>>,
     #[serde(default)]
     rethumb: bool,
+    #[serde(default)]
+    retry_failed: bool,
 }
 
 async fn rescan(State(app): S, body: Option<Json<RescanReq>>) -> Response {
     let Json(b) = body.unwrap_or(Json(RescanReq::default()));
-    scan::spawn(app, b.libs, b.rethumb);
+    scan::spawn_ex(app, b.libs, b.rethumb, b.retry_failed);
     Json(json!({"ok": true})).into_response()
 }
 
@@ -675,11 +706,10 @@ async fn full(State(app): S, AxPath(id): AxPath<i64>, headers: HeaderMap) -> Res
         Err(e) => return e,
     };
 
-    let browser_native =
-        matches!(ext.as_str(), "jpg" | "jpeg" | "jfif" | "png" | "webp" | "gif" | "bmp" | "avif");
-    if browser_native {
-        let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
-        return stream::file_range(std::path::Path::new(&path), &headers, &mime, None).await;
+    // Serve straight off disk when the bytes really are something a browser can
+    // draw, whatever the extension claims.
+    if let Some(mime) = decode::browser_native(std::path::Path::new(&path)) {
+        return stream::file_range(std::path::Path::new(&path), &headers, mime, None).await;
     }
 
     match blocking(move || {
@@ -1294,6 +1324,158 @@ async fn face_thumb(State(app): S, AxPath(id): AxPath<i64>) -> Response {
     let a = app.clone();
     match blocking(move || ml::face_thumb(&a, id)).await {
         Ok(d) => stream::bytes_response(d, "image/jpeg", true),
+        Err(e) => e,
+    }
+}
+
+/// Download a current ffmpeg into Speckle's own folder, then retry everything
+/// that previously could not be read.
+async fn install_ffmpeg(State(app): S) -> Response {
+    if app.jobs.read().task.as_ref().map(|t| t.running).unwrap_or(false) {
+        return err(StatusCode::CONFLICT, "a download or bulk job is already running");
+    }
+    tools::spawn_install_ffmpeg(app);
+    Json(json!({"ok": true})).into_response()
+}
+
+// ------------------------------------------------------------- desktop -----
+
+/// Ask the host for a folder using its own dialog. Runs on a blocking thread
+/// because the dialog is modal.
+async fn pick_folder(State(_app): S) -> Response {
+    match tokio::task::spawn_blocking(sets::pick_folder_native).await {
+        Ok(Some(p)) => Json(json!({"path": p})).into_response(),
+        Ok(None) => Json(json!({"path": Value::Null})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("dialog failed: {e}")),
+    }
+}
+
+async fn get_startup() -> Response {
+    Json(json!({"enabled": sets::startup_enabled()})).into_response()
+}
+
+#[derive(Deserialize)]
+struct EnabledReq {
+    #[serde(default)]
+    enabled: bool,
+}
+
+async fn post_startup(Json(b): Json<EnabledReq>) -> Response {
+    match sets::set_startup(b.enabled) {
+        Ok(_) => Json(json!({"ok": true, "enabled": sets::startup_enabled()})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+    }
+}
+
+/// Every sub-folder of a library, so the user can tick the ones to leave out.
+/// Reported from the filesystem rather than the index, because a folder that is
+/// already excluded has no rows to count.
+async fn library_folders(State(app): S, AxPath(id): AxPath<i64>) -> Response {
+    let a = app.clone();
+    match blocking(move || {
+        let c = a.index.get()?;
+        let (root, excludes): (String, String) = c.query_row(
+            "SELECT path, excludes FROM libraries WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let ex: Vec<String> = excludes.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+
+        let mut out: Vec<Value> = Vec::new();
+        for e in walkdir::WalkDir::new(&root)
+            .min_depth(1)
+            .max_depth(3)
+            .into_iter()
+            .filter_entry(|e| {
+                !e.file_name().to_string_lossy().starts_with('.')
+                    && e.file_name() != std::ffi::OsStr::new("System Volume Information")
+            })
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_dir())
+        {
+            let rel = e.path().strip_prefix(&root).unwrap_or(e.path()).to_string_lossy().replace('\\', "/");
+            if rel.is_empty() {
+                continue;
+            }
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM media WHERE lib=?1 AND (sub=?2 OR sub LIKE ?2 || '/%')",
+                    rusqlite::params![id, &rel],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            out.push(json!({
+                "sub": rel, "count": n,
+                "excluded": ex.iter().any(|x| rel == *x)
+            }));
+            if out.len() >= 2000 {
+                break;
+            }
+        }
+        out.sort_by(|a, b| a["sub"].as_str().unwrap_or("").cmp(b["sub"].as_str().unwrap_or("")));
+        Ok(json!({"folders": out, "excludes": ex}))
+    })
+    .await
+    {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => e,
+    }
+}
+
+#[derive(Deserialize)]
+struct ExcludesReq {
+    #[serde(default)]
+    subs: Vec<String>,
+}
+
+/// Replace a library's exclusion list, then drop anything already indexed
+/// underneath those folders so the change takes effect immediately rather than
+/// at the next walk.
+async fn set_excludes(State(app): S, AxPath(id): AxPath<i64>, Json(b): Json<ExcludesReq>) -> Response {
+    let a = app.clone();
+    let res = blocking(move || {
+        let subs: Vec<String> = b
+            .subs
+            .iter()
+            .map(|s| s.trim().trim_matches('/').replace('\\', "/"))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let c = a.index.get()?;
+        c.execute(
+            "UPDATE libraries SET excludes=?2 WHERE id=?1",
+            rusqlite::params![id, subs.join("\n")],
+        )?;
+
+        let mut removed = 0usize;
+        let mut gone: Vec<i64> = Vec::new();
+        for sub in &subs {
+            let mut st = c.prepare(
+                "SELECT id FROM media WHERE lib=?1 AND (sub=?2 OR sub LIKE ?2 || '/%')",
+            )?;
+            let ids: Vec<i64> = st
+                .query_map(rusqlite::params![id, sub], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            gone.extend(ids);
+        }
+        for chunk in gone.chunks(400) {
+            let list = chunk.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            removed += c.execute(&format!("DELETE FROM media WHERE id IN ({list})"), [])? as usize;
+        }
+        tools::prune_orphans(&c)?;
+        drop(c);
+        if !gone.is_empty() {
+            let t = a.thumbs.get()?;
+            for chunk in gone.chunks(400) {
+                let list = chunk.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+                let _ = t.execute(&format!("DELETE FROM t WHERE id IN ({list})"), []);
+            }
+        }
+        Ok(json!({"ok": true, "excluded": subs.len(), "removed": removed}))
+    })
+    .await;
+
+    match res {
+        Ok(v) => Json(v).into_response(),
         Err(e) => e,
     }
 }

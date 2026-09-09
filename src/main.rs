@@ -40,6 +40,13 @@ pub struct App {
     /// Set when a scan was asked for while something else was running. The
     /// background worker picks it up, so a request is never silently lost.
     pub rescan_pending: std::sync::atomic::AtomicBool,
+    /// Set when the deferred scan should also re-attempt previously unreadable
+    /// files, so asking for a retry during a long pass is not silently downgraded.
+    pub retry_pending: std::sync::atomic::AtomicBool,
+    /// Counts for the status bar, recomputed at most every couple of seconds.
+    /// The UI polls continuously, and a dozen COUNT(*) queries over a quarter of
+    /// a million rows is not something to run on every poll.
+    pub counts_cache: RwLock<Option<(std::time::Instant, serde_json::Value)>>,
 }
 
 fn main() -> Result<()> {
@@ -48,6 +55,9 @@ fn main() -> Result<()> {
     let data_dir = pick_data_dir();
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+
+    // Prefer our own ffmpeg over PATH, when one has been downloaded.
+    decode::set_tools_dir(data_dir.join("tools"));
 
     let index = db::Pool::new(data_dir.join("index.db"), db::INDEX_SCHEMA)?;
     let thumbs = db::Pool::new(data_dir.join("thumbs.db"), db::THUMB_SCHEMA)?;
@@ -75,6 +85,8 @@ fn main() -> Result<()> {
         clip: RwLock::new(None),
         faces: RwLock::new(None),
         rescan_pending: std::sync::atomic::AtomicBool::new(false),
+        retry_pending: std::sync::atomic::AtomicBool::new(false),
+        counts_cache: RwLock::new(None),
     });
 
     println!("[speckle] data      {}", data_dir.display());

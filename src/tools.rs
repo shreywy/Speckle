@@ -906,3 +906,58 @@ pub fn browse(path: Option<&str>) -> Result<serde_json::Value> {
     let parent = dir.parent().map(|p| p.to_string_lossy().replace('\\', "/"));
     Ok(json!({"path": path.replace('\\', "/"), "parent": parent, "entries": entries}))
 }
+
+
+// ------------------------------------------------------------- ffmpeg ------
+
+/// Current Windows build. FFmpeg only learned to read HEIC in 7.0, and the
+/// build most people already have on PATH predates that — which quietly makes
+/// every iPhone photo in a library unreadable.
+const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+
+pub fn tools_dir(app: &App) -> PathBuf {
+    app.data_dir.join("tools")
+}
+
+/// Fetch a current ffmpeg into Speckle's own directory and switch to it. Does
+/// not touch the system, PATH, or whatever ffmpeg the user already has.
+pub fn spawn_install_ffmpeg(app: Arc<App>) {
+    std::thread::spawn(move || {
+        // Downloading is network-bound, so it runs alongside whatever else is
+        // happening and reports on the secondary progress channel.
+        task_set(&app, |t| {
+            *t = TaskInfo {
+                kind: "download".into(),
+                label: "ffmpeg".into(),
+                running: true,
+                ..Default::default()
+            }
+        });
+        let res = (|| -> Result<()> {
+            let dir = tools_dir(&app);
+            std::fs::create_dir_all(&dir)?;
+            let zip_path = dir.join("ffmpeg.zip");
+            crate::ml::fetch_with(&app, FFMPEG_URL, &zip_path, 112_000_000, "ffmpeg", true)?;
+            task_set(&app, |t| t.label = "Unpacking ffmpeg…".into());
+            crate::ml::extract_needed(&zip_path, &dir, &["ffmpeg.exe", "ffprobe.exe"])?;
+            let _ = std::fs::remove_file(&zip_path);
+            crate::decode::set_tools_dir(dir);
+            Ok(())
+        })();
+
+        task_set(&app, |t| {
+            t.running = false;
+            t.message = match &res {
+                Err(e) => format!("ffmpeg download failed: {e}"),
+                Ok(_) => "Installed a current ffmpeg".into(),
+            };
+        });
+        match res {
+            Ok(()) => {
+                println!("[speckle] installed a current ffmpeg; retrying unreadable files");
+                crate::scan::spawn_ex(app, None, false, true);
+            }
+            Err(e) => eprintln!("[speckle] ffmpeg install failed: {e:#}"),
+        }
+    });
+}

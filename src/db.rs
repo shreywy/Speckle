@@ -67,6 +67,7 @@ impl Pool {
         // "ADD COLUMN IF NOT EXISTS", so a failure here just means it is present.
         let _ = c.execute("ALTER TABLE media ADD COLUMN facedone INTEGER NOT NULL DEFAULT 0", []);
         let _ = c.execute("ALTER TABLE people ADD COLUMN centroid BLOB", []);
+        let _ = c.execute("ALTER TABLE libraries ADD COLUMN excludes TEXT NOT NULL DEFAULT ''", []);
         c.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -105,7 +106,11 @@ CREATE TABLE IF NOT EXISTS libraries (
   path     TEXT NOT NULL UNIQUE,
   name     TEXT NOT NULL,
   color    TEXT NOT NULL DEFAULT '#4B79E4',
-  added_at INTEGER NOT NULL
+  added_at INTEGER NOT NULL,
+  -- Sub-folders to skip, newline separated and relative to the library root.
+  -- Kept as text rather than a table because it is read on every walk and
+  -- edited as a whole.
+  excludes TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS media (

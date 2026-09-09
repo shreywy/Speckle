@@ -67,11 +67,20 @@ fn set<F: FnOnce(&mut Job)>(j: &JobState, f: F) {
 /// Kick off a scan on a background thread. Returns immediately; progress is
 /// readable from the shared `Job`.
 pub fn spawn(app: Arc<App>, libs: Option<Vec<i64>>, rethumb: bool) {
+    spawn_ex(app, libs, rethumb, false)
+}
+
+/// `retry_failed` re-queues only the files that previously could not be read —
+/// useful after a decoder fix, and far cheaper than rebuilding every thumbnail.
+pub fn spawn_ex(app: Arc<App>, libs: Option<Vec<i64>>, rethumb: bool, retry_failed: bool) {
     if app.job.read().running {
         // Something else has the disk. Remember that a scan is owed rather than
         // dropping it — otherwise adding a folder during a tagging pass would
         // quietly never index anything.
         app.rescan_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+        if retry_failed {
+            app.retry_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         return;
     }
     set(&app.job, |j| {
@@ -79,6 +88,14 @@ pub fn spawn(app: Arc<App>, libs: Option<Vec<i64>>, rethumb: bool) {
     });
 
     std::thread::spawn(move || {
+        if retry_failed {
+            if let Ok(c) = app.index.get() {
+                match c.execute("UPDATE media SET state=0, err=NULL WHERE state=2", []) {
+                    Ok(n) => println!("[scan] retrying {n} previously unreadable files"),
+                    Err(e) => eprintln!("[scan] retry reset failed: {e}"),
+                }
+            }
+        }
         if let Err(e) = run(&app, libs, rethumb) {
             eprintln!("[scan] failed: {e:#}");
             set(&app.job, |j| j.label = format!("failed: {e}"));
@@ -105,7 +122,16 @@ fn run(app: &Arc<App>, libs: Option<Vec<i64>>, rethumb: bool) -> Result<()> {
     };
 
     for (lib_id, root) in &targets {
-        walk_library(app, &conn, *lib_id, Path::new(root))?;
+        let excludes: Vec<String> = conn
+            .query_row("SELECT excludes FROM libraries WHERE id=?1", [lib_id], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap_or_default()
+            .lines()
+            .map(|s| s.trim().trim_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        walk_library(app, &conn, *lib_id, Path::new(root), &excludes)?;
     }
 
     if rethumb {
@@ -123,7 +149,13 @@ fn run(app: &Arc<App>, libs: Option<Vec<i64>>, rethumb: bool) -> Result<()> {
 }
 
 /// Phase one. Recursive, depth-unlimited, and cheap: nothing here opens a file.
-fn walk_library(app: &Arc<App>, conn: &rusqlite::Connection, lib: i64, root: &Path) -> Result<()> {
+fn walk_library(
+    app: &Arc<App>,
+    conn: &rusqlite::Connection,
+    lib: i64,
+    root: &Path,
+    excludes: &[String],
+) -> Result<()> {
     set(&app.job, |j| {
         j.phase = "scanning".into();
         j.label = root.display().to_string();
@@ -150,6 +182,15 @@ fn walk_library(app: &Arc<App>, conn: &rusqlite::Connection, lib: i64, root: &Pa
         }
         if name.starts_with('$') || name == "System Volume Information" {
             return false;
+        }
+        // Folders the user has chosen to leave out, matched on the path
+        // relative to the library root so "Screenshots" cannot accidentally
+        // exclude "Holiday/Screenshots of maps" elsewhere.
+        if let Ok(rel) = e.path().strip_prefix(root) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if excludes.iter().any(|x| rel == *x || rel.starts_with(&format!("{x}/"))) {
+                return false;
+            }
         }
         e.path() != data_dir
     });

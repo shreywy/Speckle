@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use image::{DynamicImage, GenericImageView};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::db::{KIND_LAYERED, KIND_PHOTO, KIND_RAW, KIND_VIDEO};
@@ -25,6 +25,46 @@ pub const VIDEO_EXT: &[&str] = &[
     "mp4", "mov", "m4v", "avi", "mkv", "webm", "wmv", "flv", "3gp", "3g2", "mts", "m2ts", "mpg",
     "mpeg", "vob", "ogv", "mxf", "ts",
 ];
+
+/// What a file actually is, from its first bytes.
+///
+/// Extensions lie. Phone exports and cloud takeouts routinely hand back a plain
+/// JPEG named `.HEIC` or `.PNG`, and trusting the name sends it down a decoder
+/// that cannot read it. Sniffing costs one 16-byte read and rescues those files.
+pub fn sniff(path: &Path) -> Option<image::ImageFormat> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 16];
+    let n = f.read(&mut head).ok()?;
+    let h = &head[..n];
+    if h.len() < 4 {
+        return None;
+    }
+    Some(match h {
+        _ if h.starts_with(&[0xFF, 0xD8, 0xFF]) => image::ImageFormat::Jpeg,
+        _ if h.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) => image::ImageFormat::Png,
+        _ if h.starts_with(b"GIF8") => image::ImageFormat::Gif,
+        _ if h.starts_with(b"BM") => image::ImageFormat::Bmp,
+        _ if h.len() >= 12 && &h[0..4] == b"RIFF" && &h[8..12] == b"WEBP" => image::ImageFormat::WebP,
+        _ if h.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || h.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) => {
+            image::ImageFormat::Tiff
+        }
+        _ => return None,
+    })
+}
+
+/// A file the browser can display as-is, with the media type its bytes deserve
+/// rather than the one its name claims.
+pub fn browser_native(path: &Path) -> Option<&'static str> {
+    match sniff(path)? {
+        image::ImageFormat::Jpeg => Some("image/jpeg"),
+        image::ImageFormat::Png => Some("image/png"),
+        image::ImageFormat::Gif => Some("image/gif"),
+        image::ImageFormat::WebP => Some("image/webp"),
+        image::ImageFormat::Bmp => Some("image/bmp"),
+        _ => None,
+    }
+}
 
 /// Which decode path an extension takes, or `None` if we do not handle it.
 pub fn classify(ext: &str) -> Option<i64> {
@@ -65,12 +105,55 @@ pub fn video_plays_natively(ext: &str, vcodec: Option<&str>, acodec: Option<&str
 
 // ---------------------------------------------------------------- ffmpeg ----
 
-fn ffmpeg_bin() -> &'static str {
-    "ffmpeg"
+/// Where to find ffmpeg. A copy inside the data directory wins over whatever is
+/// on PATH, because the one on PATH is frequently years old — and versions
+/// before 7.0 cannot read HEIC at all, which silently loses every iPhone photo
+/// in a library.
+static FFMPEG_DIR: parking_lot::RwLock<Option<PathBuf>> = parking_lot::RwLock::new(None);
+
+pub fn set_tools_dir(dir: PathBuf) {
+    let have = dir.join("ffmpeg.exe").exists() || dir.join("ffmpeg").exists();
+    *FFMPEG_DIR.write() = if have { Some(dir) } else { None };
 }
-fn ffprobe_bin() -> &'static str {
-    "ffprobe"
+
+/// True when Speckle is using its own downloaded copy rather than PATH.
+pub fn using_own_ffmpeg() -> bool {
+    FFMPEG_DIR.read().is_some()
 }
+
+fn tool(name: &str) -> String {
+    if let Some(dir) = FFMPEG_DIR.read().as_ref() {
+        let exe = dir.join(format!("{name}.exe"));
+        if exe.exists() {
+            return exe.to_string_lossy().to_string();
+        }
+        let plain = dir.join(name);
+        if plain.exists() {
+            return plain.to_string_lossy().to_string();
+        }
+    }
+    name.to_string()
+}
+
+fn ffmpeg_bin() -> String {
+    tool("ffmpeg")
+}
+fn ffprobe_bin() -> String {
+    tool("ffprobe")
+}
+
+/// The ffmpeg version string, for showing the user what they are running.
+pub fn ffmpeg_version() -> Option<String> {
+    let mut cmd = Command::new(ffmpeg_bin());
+    hidden(&mut cmd);
+    let out = cmd.arg("-version").stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null()).output().ok()?;
+    let first = String::from_utf8_lossy(&out.stdout).lines().next()?.to_string();
+    let v = first.trim_start_matches("ffmpeg version ");
+    // Drop the copyright tail; only the build identifier is useful to show.
+    Some(v.split(" Copyright").next().unwrap_or(v).trim().to_string())
+}
+
+
 
 /// Is ffmpeg reachable? Checked once at startup so the UI can say so plainly
 /// rather than silently producing blank video tiles.
@@ -462,6 +545,26 @@ pub fn apply_orientation(img: DynamicImage, orient: i64) -> DynamicImage {
 /// Decode any supported file to pixels, at roughly `max_edge` where the format
 /// lets us ask for that cheaply. Orientation is already applied.
 pub fn load(path: &Path, kind: i64, ext: &str, max_edge: u32) -> Result<DynamicImage> {
+    // Believe the bytes over the name. A JPEG called `.HEIC` decodes here
+    // instead of being handed to ffmpeg, which would reject it.
+    if kind != KIND_VIDEO {
+        if let Some(fmt) = sniff(path) {
+            let named_raw = RAW_EXT.contains(&ext.to_ascii_lowercase().as_str());
+            // A RAW file legitimately starts with TIFF magic, so only trust the
+            // sniff for RAW when it says something a RAW could not be.
+            if !(named_raw && fmt == image::ImageFormat::Tiff) {
+                let file = std::io::BufReader::new(std::fs::File::open(path)?);
+                let mut reader = image::ImageReader::new(file);
+                reader.set_format(fmt);
+                reader.no_limits();
+                if let Ok(img) = reader.decode() {
+                    let orient = read_exif(path).orient;
+                    return Ok(apply_orientation(img, orient));
+                }
+            }
+        }
+    }
+
     let img = match kind {
         KIND_VIDEO => {
             let probe = probe_video(path).unwrap_or_default();
@@ -490,8 +593,20 @@ pub fn load(path: &Path, kind: i64, ext: &str, max_edge: u32) -> Result<DynamicI
             }
         }
         _ if is_heic(ext) => {
-            let jpg = ffmpeg_frame(path, None, max_edge)?;
-            image::load_from_memory_with_format(&jpg, image::ImageFormat::Jpeg)?
+            // ffmpeg is the good path when the build can demux HEIF, but plenty
+            // of ffmpeg builds cannot and report "moov atom not found" on a
+            // perfectly valid `ftypheic` file. Apple embeds a JPEG preview in
+            // its HEICs, so fall back to lifting that out rather than losing
+            // the photo entirely.
+            match ffmpeg_frame(path, None, max_edge) {
+                Ok(jpg) => image::load_from_memory_with_format(&jpg, image::ImageFormat::Jpeg)?,
+                Err(ff) => {
+                    let bytes = read_capped(path, 96 * 1024 * 1024)?;
+                    largest_embedded_jpeg(&bytes).ok_or_else(|| {
+                        anyhow!("ffmpeg could not read this HEIC and it has no embedded preview: {ff}")
+                    })?
+                }
+            }
         }
         _ => image::open(path).with_context(|| format!("decoding {}", path.display()))?,
     };
